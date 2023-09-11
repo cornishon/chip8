@@ -1,16 +1,68 @@
-use std::{fs, ops::RangeInclusive};
+use std::io::Write;
+use std::time::Duration;
+use std::{fs, io, ops::RangeInclusive};
 
 use deku::{bitvec::BitView, prelude::*};
 
-fn main() {
+use crossterm::event::{Event, KeyCode};
+use crossterm::{cursor, event, style, terminal, ExecutableCommand, QueueableCommand};
+
+fn main() -> io::Result<()> {
     let program_path = std::env::args()
         .nth(1)
         .expect("USAGE: ./chip8 <PROGRAM.ch8>");
-    let src = fs::read(&program_path).expect(&format!("could not open file: {}", program_path));
+    let src = fs::read(&program_path)?;
 
-    let mut chip8 = Chip8::new();
+    let original_terminal_size = terminal::size()?;
+    prepare_ui(original_terminal_size)?;
+
+    let screen = Screen::new(io::stdout());
+    let mut chip8 = Chip8::new(screen);
     chip8.load_program(&src);
-    chip8.run();
+
+    let result = run(chip8);
+
+    restore_ui(original_terminal_size)?;
+    result
+}
+
+fn run(mut chip8: Chip8) -> io::Result<()> {
+    loop {
+        chip8.tick()?;
+
+        if event::poll(Duration::ZERO)? {
+            if event::read()? == Event::Key(KeyCode::Char('q').into()) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn prepare_ui((rows, cols): (u16, u16)) -> io::Result<()> {
+    if rows < 128 || cols < 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "Minimum supported terminal size is 128x64, but current size is: {rows}x{cols}"
+            ),
+        ));
+    }
+    terminal::enable_raw_mode()?;
+    io::stdout()
+        .execute(terminal::SetSize(SCREEN_WIDTH as u16, SCREEN_HEIGHT as u16))?
+        .execute(terminal::Clear(terminal::ClearType::All))?
+        .execute(cursor::Hide)?;
+    Ok(())
+}
+
+fn restore_ui((rows, cols): (u16, u16)) -> io::Result<()> {
+    io::stdout()
+        .execute(terminal::SetSize(cols, rows))?
+        .execute(terminal::Clear(terminal::ClearType::All))?
+        .execute(cursor::Show)?
+        .execute(style::ResetColor)?;
+    terminal::disable_raw_mode()?;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
@@ -211,7 +263,7 @@ impl std::ops::IndexMut<u8> for Registers {
 }
 
 impl Chip8 {
-    fn new() -> Self {
+    fn new(screen: Screen) -> Self {
         let mut mem = Box::new([0; 1024 * 4]);
         mem[FONT_RANGE].copy_from_slice(FONT);
 
@@ -223,7 +275,7 @@ impl Chip8 {
             dt: 0,
             st: 0,
             v: Registers([0; 16]),
-            screen: Screen::new(),
+            screen,
         }
     }
 
@@ -232,21 +284,13 @@ impl Chip8 {
         self.mem[pc..pc + program.len()].copy_from_slice(program)
     }
 
-    fn run(&mut self) {
-        loop {
-            let (_, op) = Op::from_bytes((&self.mem[self.pc as usize..], 0)).unwrap();
-            self.pc += 2;
-            // dbg!(&op);
-            self.execute(op);
-            // self.screen.draw();
-            std::thread::sleep(std::time::Duration::from_micros(500));
-            // let esc = 27 as char;
-            // println!("{esc}[2J{esc}[H]");
-            std::thread::sleep(std::time::Duration::from_micros(500));
-        }
+    fn tick(&mut self) -> io::Result<()> {
+        let (_, op) = Op::from_bytes((&self.mem[self.pc as usize..], 0)).unwrap();
+        self.pc += 2;
+        self.execute(op)
     }
 
-    fn execute(&mut self, op: Op) {
+    fn execute(&mut self, op: Op) -> io::Result<()> {
         match op {
             Op::AbsJump(addr) => {
                 self.pc = addr;
@@ -259,7 +303,7 @@ impl Chip8 {
                 self.pc = self.stack.pop().expect("stack underflow");
             }
             Op::Clear => {
-                self.screen.clear();
+                self.screen.clear()?;
             }
             Op::SkipEqVal(x, val) => {
                 if self.v[x] == val {
@@ -355,11 +399,12 @@ impl Chip8 {
                         }
                     }
                 }
-
-                self.screen.draw();
+                self.screen.draw()?;
             }
             _ => todo!("{:?}", op),
         }
+
+        Ok(())
     }
 }
 
@@ -389,15 +434,17 @@ const N_PIXELS: usize = SCREEN_WIDTH * SCREEN_HEIGHT;
 
 struct Screen {
     pixels: [bool; N_PIXELS],
+    output: io::Stdout,
 }
 
 impl Screen {
     const ON: &str = "\u{2588}\u{2588}";
     const OFF: &str = "  ";
 
-    fn new() -> Self {
+    fn new(output: io::Stdout) -> Self {
         Screen {
             pixels: [false; N_PIXELS],
+            output,
         }
     }
 
@@ -410,29 +457,26 @@ impl Screen {
         &mut self.pixels[SCREEN_WIDTH * y + x]
     }
 
-    fn draw(&self) {
-        println!("{esc}[2J", esc = 27 as char);
+    fn draw(&mut self) -> io::Result<()> {
         for y in 0..SCREEN_HEIGHT {
             for x in 0..SCREEN_WIDTH {
-                print!(
-                    "{}",
-                    if *self.pixel(x, y) {
-                        Self::ON
-                    } else {
-                        Self::OFF
-                    }
-                );
+                let symbol = if *self.pixel(x, y) {
+                    Self::ON
+                } else {
+                    Self::OFF
+                };
+                self.output
+                    .queue(cursor::MoveTo(x as u16 * 2, y as u16))?
+                    .queue(style::Print(symbol))?;
             }
-            println!("");
         }
-        println!("{esc}[1;1H", esc = 27 as char);
+        self.output.flush()
     }
 
     #[inline]
-    fn clear(&mut self) {
-        for pixel in &mut self.pixels {
-            *pixel = false;
-        }
-        println!("{esc}[2J", esc = 27 as char);
+    fn clear(&mut self) -> io::Result<()> {
+        self.output
+            .execute(terminal::Clear(terminal::ClearType::All))?;
+        Ok(())
     }
 }
