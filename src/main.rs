@@ -401,7 +401,7 @@ impl Chip8 {
                 }
                 self.screen.draw()?;
             }
-            _ => todo!("{:?}", op),
+            _ => todo!("{:#04x?}", op),
         }
 
         Ok(())
@@ -475,6 +475,7 @@ impl Screen {
 
     #[inline]
     fn clear(&mut self) -> io::Result<()> {
+        self.pixels.fill(false);
         self.output
             .execute(terminal::Clear(terminal::ClearType::All))?;
         Ok(())
